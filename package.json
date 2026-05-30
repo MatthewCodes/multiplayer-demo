@@ -1,0 +1,16 @@
+{
+  "name": "threejs-multiplayer-poc",
+  "version": "1.0.0",
+  "description": "Tiny multiplayer Three.js proof of concept: shared arena, player avatars, and a server-authoritative ball.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

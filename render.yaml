@@ -1,0 +1,10 @@
+# Render deployment config. Push this repo to GitHub, then in the Render
+# dashboard choose "New +" -> "Blueprint" and point it at the repo. Render
+# reads this file and provisions the service automatically (free tier).
+services:
+  - type: web
+    name: threejs-multiplayer-poc
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start

@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>⚽ Multiplayer Soccer POC</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; font-family: system-ui, sans-serif; background: #0b0e14; }
+    #app { position: fixed; inset: 0; }
+
+    /* Login overlay */
+    #login {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      background: radial-gradient(circle at 50% 30%, #1b2333, #0b0e14); z-index: 20;
+    }
+    #login .card {
+      background: #151b27; padding: 32px 36px; border-radius: 16px; width: 340px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.5); text-align: center; color: #e6edf3;
+    }
+    #login h1 { font-size: 22px; margin-bottom: 6px; }
+    #login p { font-size: 13px; color: #8b98a9; margin-bottom: 20px; line-height: 1.5; }
+    #login input {
+      width: 100%; padding: 12px 14px; border-radius: 10px;
+      border: 1px solid #2a3342; background: #0e131c; color: #fff; font-size: 15px; margin-bottom: 14px; outline: none;
+    }
+    #login input:focus { border-color: #40c4ff; }
+    #login button {
+      width: 100%; padding: 12px; border: none; border-radius: 10px; cursor: pointer;
+      background: #40c4ff; color: #03121c; font-weight: 700; font-size: 15px;
+    }
+    #login button:hover { background: #67d2ff; }
+
+    /* Scoreboard (top center) */
+    #scoreboard {
+      position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 6;
+      display: none; align-items: center; gap: 16px;
+      background: rgba(10,14,20,.7); padding: 10px 22px; border-radius: 14px;
+      backdrop-filter: blur(6px); box-shadow: 0 6px 24px rgba(0,0,0,.4);
+      font-size: 22px; font-weight: 800; color: #e6edf3; letter-spacing: .5px;
+    }
+    #scoreboard .team { display: flex; align-items: center; gap: 8px; padding: 2px 6px; border-radius: 8px; }
+    #scoreboard .dot { width: 14px; height: 14px; border-radius: 50%; display: inline-block; }
+    #scoreboard .mine { outline: 2px solid #fff3; }
+    #scoreboard .vs { color: #5b6b80; font-weight: 600; }
+    #t1 { color: #ff7b7b; }
+    #t2 { color: #6fd0ff; }
+
+    /* HUD (bottom left) */
+    #hud {
+      position: fixed; bottom: 12px; left: 12px; z-index: 5; color: #cdd9e5; font-size: 13px;
+      background: rgba(10,14,20,.6); padding: 10px 14px; border-radius: 10px; line-height: 1.6;
+      pointer-events: none; backdrop-filter: blur(4px); display: none;
+    }
+    #hud b { color: #fff; }
+    #status { color: #ffd740; }
+
+    /* Center banner (goal! / winner) */
+    #banner {
+      position: fixed; top: 38%; left: 50%; transform: translate(-50%,-50%) scale(.8);
+      z-index: 12; text-align: center; pointer-events: none; opacity: 0;
+      transition: opacity .25s, transform .25s; color: #fff;
+      font-weight: 900; text-shadow: 0 4px 24px rgba(0,0,0,.6);
+    }
+    #banner.show { opacity: 1; transform: translate(-50%,-50%) scale(1); }
+    #banner .big { font-size: 64px; line-height: 1.1; }
+    #banner .sub { font-size: 20px; margin-top: 8px; color: #cdd9e5; font-weight: 600; }
+
+    /* Confetti */
+    .confetti {
+      position: fixed; top: -24px; width: 10px; height: 14px; z-index: 10;
+      border-radius: 2px; pointer-events: none; will-change: transform, opacity;
+    }
+    @keyframes confettiFall {
+      0%   { transform: translateY(-10px) rotate(0deg); opacity: 1; }
+      100% { transform: translateY(108vh) rotate(720deg); opacity: .9; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="scoreboard">
+    <span class="team" id="t1box"><span class="dot" style="background:#ff5252"></span><span id="t1">Red <span id="s1">0</span></span></span>
+    <span class="vs">–</span>
+    <span class="team" id="t2box"><span class="dot" style="background:#40c4ff"></span><span id="t2">Blue <span id="s2">0</span></span></span>
+  </div>
+
+  <div id="banner"></div>
+
+  <div id="login">
+    <div class="card">
+      <h1>⚽ Multiplayer Soccer</h1>
+      <p>Pick a name and join. You'll be assigned to <b>Red</b> or <b>Blue</b>.
+         Move with <b>WASD</b>, ram the ball into the other team's goal. First to 5 wins!</p>
+      <input id="name" type="text" placeholder="Your name" maxlength="16" autocomplete="off" />
+      <button id="joinBtn">Join match</button>
+    </div>
+  </div>
+
+  <div id="hud">
+    <div>Move: <b>WASD</b> / Arrow keys</div>
+    <div>You: <b id="meTeam">—</b></div>
+    <div>Players online: <b id="count">1</b></div>
+    <div id="status">connecting…</div>
+  </div>
+
+  <script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+
+  <script type="module">
+    import * as THREE from "three";
+
+    // Pitch constants — must match server.js
+    let ARENA_X = 15, ARENA_Z = 22, GOAL_HALF = 5, WIN_SCORE = 5;
+    const TEAM_HEX = { 1: 0xff5252, 2: 0x40c4ff };
+
+    // ---------- Scene ----------
+    const app = document.getElementById("app");
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e14);
+    scene.fog = new THREE.Fog(0x0b0e14, 50, 110);
+
+    const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 300);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    app.appendChild(renderer.domElement);
+
+    addEventListener("resize", () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // Lights
+    scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x202830, 1.1));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+    sun.position.set(12, 24, 10);
+    scene.add(sun);
+
+    // ---------- Pitch ----------
+    const WHITE = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    function lineBox(w, d, x, z) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, 0.05, d), WHITE);
+      m.position.set(x, 0.02, z);
+      return m;
+    }
+
+    function buildPitch() {
+      // Grass with mowed stripes
+      const stripes = 10;
+      for (let i = 0; i < stripes; i++) {
+        const c = i % 2 === 0 ? 0x2c7a3f : 0x256b37;
+        const seg = new THREE.Mesh(
+          new THREE.PlaneGeometry(ARENA_X * 2, (ARENA_Z * 2) / stripes),
+          new THREE.MeshStandardMaterial({ color: c, roughness: 1 })
+        );
+        seg.rotation.x = -Math.PI / 2;
+        seg.position.z = -ARENA_Z + (i + 0.5) * (ARENA_Z * 2 / stripes);
+        scene.add(seg);
+      }
+
+      // Field markings
+      scene.add(lineBox(ARENA_X * 2, 0.25, 0, 0));               // halfway line
+      scene.add(lineBox(0.25, ARENA_Z * 2, -ARENA_X, 0));        // sideline L
+      scene.add(lineBox(0.25, ARENA_Z * 2,  ARENA_X, 0));        // sideline R
+      scene.add(lineBox(ARENA_X * 2, 0.25, 0, -ARENA_Z));        // goal line near
+      scene.add(lineBox(ARENA_X * 2, 0.25, 0,  ARENA_Z));        // goal line far
+      const circle = new THREE.Mesh(
+        new THREE.RingGeometry(3.7, 4, 48), WHITE
+      );
+      circle.rotation.x = -Math.PI / 2; circle.position.y = 0.02;
+      scene.add(circle);
+
+      // Goals at each end (colored by the defending team)
+      makeGoal(+1, TEAM_HEX[2]); // +Z end belongs to Team 2 (Blue)
+      makeGoal(-1, TEAM_HEX[1]); // -Z end belongs to Team 1 (Red)
+    }
+
+    function makeGoal(zSign, color) {
+      const z = zSign * ARENA_Z;
+      const H = 3.2, postR = 0.16;
+      const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: 0.2, emissive: color, emissiveIntensity: 0.15 });
+      const postGeo = new THREE.CylinderGeometry(postR, postR, H, 12);
+      for (const sx of [-1, 1]) {
+        const post = new THREE.Mesh(postGeo, mat);
+        post.position.set(sx * GOAL_HALF, H / 2, z);
+        scene.add(post);
+      }
+      const bar = new THREE.Mesh(new THREE.CylinderGeometry(postR, postR, GOAL_HALF * 2, 12), mat);
+      bar.rotation.z = Math.PI / 2;
+      bar.position.set(0, H, z);
+      scene.add(bar);
+      // Net (semi-transparent slab behind the line)
+      const net = new THREE.Mesh(
+        new THREE.BoxGeometry(GOAL_HALF * 2, H, 0.1),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.12 })
+      );
+      net.position.set(0, H / 2, z + zSign * 1.4);
+      scene.add(net);
+    }
+
+    buildPitch();
+
+    // ---------- Ball ----------
+    const ball = new THREE.Mesh(
+      new THREE.SphereGeometry(0.8, 24, 16),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, metalness: 0.05 })
+    );
+    ball.position.y = 0.8;
+    scene.add(ball);
+    const ballTarget = new THREE.Vector3(0, 0.8, 0);
+
+    // ---------- Avatars ----------
+    function makeNameTag(text, color) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 256; canvas.height = 64;
+      const ctx = canvas.getContext("2d");
+      ctx.font = "bold 30px system-ui, sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(0, 0, 256, 64);
+      ctx.fillStyle = color;
+      ctx.fillText(text, 128, 34);
+      const tex = new THREE.CanvasTexture(canvas);
+      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true }));
+      sprite.scale.set(3, 0.75, 1);
+      sprite.position.y = 2.6;
+      return sprite;
+    }
+
+    function buildAvatar(group, colorHex, name) {
+      const body = new THREE.Mesh(
+        new THREE.CapsuleGeometry(0.5, 0.7, 6, 12),
+        new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.5 })
+      );
+      body.position.y = 0.85;
+      group.add(body);
+      const nose = new THREE.Mesh(
+        new THREE.ConeGeometry(0.18, 0.4, 12),
+        new THREE.MeshStandardMaterial({ color: 0xffffff })
+      );
+      nose.rotation.x = Math.PI / 2;
+      nose.position.set(0, 0.95, 0.55);
+      group.add(nose);
+      if (name != null) group.add(makeNameTag(name, "#" + colorHex.toString(16).padStart(6, "0")));
+      return body;
+    }
+
+    function makeAvatar(colorStr, name) {
+      const group = new THREE.Group();
+      buildAvatar(group, new THREE.Color(colorStr).getHex(), name);
+      scene.add(group);
+      return group;
+    }
+
+    // ---------- Networking ----------
+    let myId = null, myTeam = 1, mode = "playing";
+    const others = new Map(); // id -> { group, target:{x,z,ry} }
+    let ws = null;
+    const statusEl = document.getElementById("status");
+    const countEl = document.getElementById("count");
+    const meTeamEl = document.getElementById("meTeam");
+    const s1El = document.getElementById("s1");
+    const s2El = document.getElementById("s2");
+    const bannerEl = document.getElementById("banner");
+
+    function setScores(sc) { s1El.textContent = sc[1]; s2El.textContent = sc[2]; }
+
+    function showBanner(html, ms) {
+      bannerEl.innerHTML = html;
+      bannerEl.classList.add("show");
+      clearTimeout(showBanner._t);
+      if (ms) showBanner._t = setTimeout(() => bannerEl.classList.remove("show"), ms);
+    }
+    function hideBanner() { bannerEl.classList.remove("show"); }
+
+    function snapMeTo(spawn) {
+      if (!spawn) return;
+      me.x = spawn.x; me.z = spawn.z;
+      me.ry = myTeam === 1 ? 0 : Math.PI;
+      me.group.position.set(me.x, 0, me.z);
+      me.group.rotation.y = me.ry;
+    }
+
+    function confettiBurst() {
+      const colors = ["#ff5252", "#40c4ff", "#69f0ae", "#ffd740", "#e040fb", "#ffffff"];
+      for (let i = 0; i < 150; i++) {
+        const d = document.createElement("div");
+        d.className = "confetti";
+        d.style.left = Math.random() * 100 + "vw";
+        d.style.background = colors[i % colors.length];
+        const dur = 2 + Math.random() * 2.2;
+        d.style.animation = `confettiFall ${dur}s linear forwards`;
+        d.style.animationDelay = Math.random() * 0.4 + "s";
+        document.body.appendChild(d);
+        setTimeout(() => d.remove(), (dur + 0.5) * 1000);
+      }
+    }
+
+    function teamName(t) { return t === 1 ? "Red" : "Blue"; }
+
+    function connect(name) {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}`);
+
+      ws.onopen = () => {
+        statusEl.textContent = "connected ✓";
+        statusEl.style.color = "#69f0ae";
+        ws.send(JSON.stringify({ type: "join", name }));
+      };
+      ws.onclose = () => {
+        statusEl.textContent = "disconnected — reload to retry";
+        statusEl.style.color = "#ff5252";
+      };
+
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        switch (msg.type) {
+          case "init": {
+            myId = msg.id; myTeam = msg.team;
+            ARENA_X = msg.arenaX; ARENA_Z = msg.arenaZ; GOAL_HALF = msg.goalHalf;
+            WIN_SCORE = msg.winScore;
+            me.body.material.color.set(msg.color);
+            meTeamEl.textContent = teamName(myTeam);
+            meTeamEl.style.color = myTeam === 1 ? "#ff7b7b" : "#6fd0ff";
+            document.getElementById(myTeam === 1 ? "t1box" : "t2box").classList.add("mine");
+            setScores(msg.scores);
+            snapMeTo(msg.spawn);
+            break;
+          }
+          case "state": handleState(msg); break;
+          case "goal": {
+            mode = "celebrating";
+            setScores(msg.scores);
+            snapMeTo(msg.spawns?.[myId]);
+            ballTarget.set(0, 0.8, 0);
+            confettiBurst();
+            showBanner(
+              `<div class="big" style="color:${msg.team === 1 ? "#ff7b7b" : "#6fd0ff"}">GOAL!</div>` +
+              `<div class="sub">${teamName(msg.team)} scores — ${msg.scores[1]} : ${msg.scores[2]}</div>`,
+              2300
+            );
+            break;
+          }
+          case "gameover": {
+            mode = "gameover";
+            setScores(msg.scores);
+            confettiBurst();
+            setTimeout(confettiBurst, 600);
+            showBanner(
+              `<div class="big" style="color:${msg.winner === 1 ? "#ff7b7b" : "#6fd0ff"}">${teamName(msg.winner)} WINS! 🏆</div>` +
+              `<div class="sub">Final ${msg.scores[1]} : ${msg.scores[2]} · new match starting…</div>`
+            );
+            break;
+          }
+          case "newgame": {
+            mode = "playing";
+            setScores(msg.scores);
+            snapMeTo(msg.spawns?.[myId]);
+            ballTarget.set(0, 0.8, 0);
+            hideBanner();
+            break;
+          }
+        }
+      };
+    }
+
+    function handleState(msg) {
+      mode = msg.mode;
+      countEl.textContent = msg.players.length;
+      if (msg.scores) setScores(msg.scores);
+      const seen = new Set();
+
+      for (const p of msg.players) {
+        seen.add(p.id);
+        if (p.id === myId) continue; // we render ourselves locally
+        let entry = others.get(p.id);
+        if (!entry) {
+          entry = { group: makeAvatar(p.color, p.name), target: { x: p.x, z: p.z, ry: p.ry } };
+          entry.group.position.set(p.x, 0, p.z);
+          others.set(p.id, entry);
+        }
+        entry.target.x = p.x; entry.target.z = p.z; entry.target.ry = p.ry;
+      }
+      for (const [id, entry] of others) {
+        if (!seen.has(id)) { scene.remove(entry.group); others.delete(id); }
+      }
+      ballTarget.set(msg.ball.x, 0.8, msg.ball.z);
+    }
+
+    // ---------- Local player (client-side prediction) ----------
+    const me = { group: new THREE.Group(), body: null, x: 0, z: 0, ry: 0 };
+    me.body = buildAvatar(me.group, TEAM_HEX[1], null);
+    scene.add(me.group);
+
+    const keys = {};
+    addEventListener("keydown", (e) => { keys[e.key.toLowerCase()] = true; });
+    addEventListener("keyup", (e) => { keys[e.key.toLowerCase()] = false; });
+
+    const SPEED = 9; // units/sec
+    let lastSent = 0;
+
+    function updateLocal(dt) {
+      if (mode === "playing") {
+        let dx = 0, dz = 0;
+        if (keys["w"] || keys["arrowup"]) dz -= 1;
+        if (keys["s"] || keys["arrowdown"]) dz += 1;
+        if (keys["a"] || keys["arrowleft"]) dx -= 1;
+        if (keys["d"] || keys["arrowright"]) dx += 1;
+
+        if (dx || dz) {
+          const len = Math.hypot(dx, dz);
+          dx /= len; dz /= len;
+          me.x += dx * SPEED * dt;
+          me.z += dz * SPEED * dt;
+          me.x = Math.max(-ARENA_X, Math.min(ARENA_X, me.x));
+          me.z = Math.max(-ARENA_Z, Math.min(ARENA_Z, me.z));
+          me.ry = Math.atan2(dx, dz);
+        }
+      }
+
+      me.group.position.set(me.x, 0, me.z);
+      me.group.rotation.y = me.ry;
+
+      const now = performance.now();
+      if (ws && ws.readyState === 1 && mode === "playing" && now - lastSent > 50) {
+        ws.send(JSON.stringify({ type: "input", x: me.x, z: me.z, ry: me.ry }));
+        lastSent = now;
+      }
+    }
+
+    // ---------- Render loop ----------
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = Math.min(clock.getDelta(), 0.1);
+
+      updateLocal(dt);
+
+      for (const entry of others.values()) {
+        const g = entry.group;
+        g.position.x += (entry.target.x - g.position.x) * 0.2;
+        g.position.z += (entry.target.z - g.position.z) * 0.2;
+        let diff = entry.target.ry - g.rotation.y;
+        diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        g.rotation.y += diff * 0.2;
+      }
+
+      ball.position.x += (ballTarget.x - ball.position.x) * 0.3;
+      ball.position.z += (ballTarget.z - ball.position.z) * 0.3;
+
+      // Camera sits behind the local player's own half, looking up-field
+      // so each team attacks "away" from the camera.
+      const camSign = myTeam === 1 ? -1 : 1;
+      const desired = new THREE.Vector3(me.x * 0.4, 16, me.z + camSign * 20);
+      camera.position.lerp(desired, 0.08);
+      camera.lookAt(me.x * 0.4, 0, me.z - camSign * 6);
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ---------- Login flow ----------
+    const loginEl = document.getElementById("login");
+    const nameInput = document.getElementById("name");
+    const joinBtn = document.getElementById("joinBtn");
+
+    function join() {
+      const name = (nameInput.value || "").trim() || "Anonymous";
+      loginEl.style.display = "none";
+      document.getElementById("hud").style.display = "block";
+      document.getElementById("scoreboard").style.display = "flex";
+      connect(name);
+      renderer.domElement.focus();
+    }
+    joinBtn.addEventListener("click", join);
+    nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") join(); });
+    nameInput.focus();
+  </script>
+</body>
+</html>
