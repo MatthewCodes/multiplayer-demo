@@ -411,11 +411,12 @@ function shoot() {
   const raycaster = new THREE.Raycaster(camera.position.clone(), dir, 0, 200);
   const hits = raycaster.intersectObjects(meshes, true);
 
-  // Visual tracer + relay to other clients.
-  spawnTracer(camera.position.clone(), dir, 0xffff00);
+  // Visual tracer fired from the gun muzzle (offset from the eye) so you see it
+  // travel; relay the same origin/dir so other clients render the streak too.
+  const muzzle = new THREE.Vector3(0.28, -0.2, -0.9).applyQuaternion(camera.quaternion).add(camera.position);
+  spawnTracer(muzzle, dir, 0xffff00);
   if (ws && ws.readyState === 1) {
-    const o = camera.position;
-    ws.send(JSON.stringify({ type: 'shoot', ox: +o.x.toFixed(1), oy: +o.y.toFixed(1), oz: +o.z.toFixed(1),
+    ws.send(JSON.stringify({ type: 'shoot', ox: +muzzle.x.toFixed(1), oy: +muzzle.y.toFixed(1), oz: +muzzle.z.toFixed(1),
       dx: +dir.x.toFixed(3), dy: +dir.y.toFixed(3), dz: +dir.z.toFixed(3), w: currentWeapon }));
   }
 
@@ -463,11 +464,20 @@ function remoteShot(msg) {
 }
 
 function spawnTracer(origin, dir, color) {
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.1, 6, 6), new THREE.MeshBasicMaterial({ color }));
+  // An elongated glowing rod, oriented along the travel direction, so the shot
+  // visibly streaks forward instead of shrinking into the crosshair.
+  const len = 3.5;
+  const mesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.09, 0.09, len, 6),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
+  );
+  const d = dir.clone().normalize();
   mesh.position.copy(origin);
-  mesh.add(new THREE.PointLight(0xffaa00, 2, 5));
+  // CylinderGeometry's long axis is +Y; rotate it to point along `d`.
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d);
+  mesh.add(new THREE.PointLight(0xffaa00, 2, 6));
   scene.add(mesh);
-  bullets.push({ mesh, direction: dir.clone().normalize(), speed: 120, life: 1.2 });
+  bullets.push({ mesh, direction: d, speed: 90, life: 1.2 });
 }
 
 function createMuzzleFlash() {
