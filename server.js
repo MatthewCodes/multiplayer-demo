@@ -1,15 +1,14 @@
-// Multiplayer Three.js soccer POC — server.
+// Multiplayer Three.js shooter POC — server.
 // - Serves the static client from /public over HTTP.
 // - Runs a WebSocket server on the same port for real-time game state.
 //
 // Networking model (kept deliberately simple for a POC):
-//   * Player movement is client-authoritative: each client tells the server
-//     where it is; the server clamps it to the pitch and relays to everyone.
-//   * EVERYTHING ELSE is server-authoritative: ball physics, goal detection,
-//     scoring, spawn resets, and the "first to 5 wins" condition. That way all
-//     players always agree on the score and the ball.
-//
-// Teams: odd player IDs join Team 1, even IDs join Team 2.
+//   * Player movement + look + shot raycasts are client-authoritative, so the
+//     shooting feels instant and responsive.
+//   * Health, kills, deaths, respawns, frag scores and the "first to N wins"
+//     condition are SERVER-authoritative, so all players always agree on the
+//     score and on who is alive. A client only ever *reports* "I hit player X";
+//     the server decides what that does.
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -52,79 +51,110 @@ const httpServer = createServer(async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Pitch + game constants
+// Arena + match constants  (must line up with the client)
 // ---------------------------------------------------------------------------
-const ARENA_X = 15;        // half-width of the pitch (sidelines at ±X)
-const ARENA_Z = 22;        // half-length of the pitch (goal lines at ±Z)
-const GOAL_HALF = 5;       // half-width of the goal mouth
-const PLAYER_RADIUS = 0.6;
-const BALL_RADIUS = 0.8;
-const WIN_SCORE = 5;
+const ARENA = 40;          // half-size of the square arena
+const BOUND = 38;          // movement clamp (walls sit at ±ARENA)
+const MAX_HEALTH = 100;
+const FRAG_LIMIT = 10;     // first player to this many kills wins
+const RESPAWN_MS = 2500;
+const GAMEOVER_MS = 6000;
 
-const CELEBRATE_MS = 2500; // pause after a goal
-const GAMEOVER_MS = 7000;  // pause after a match is won, then auto-restart
-
-const TEAM_COLORS = { 1: "#ff5252", 2: "#40c4ff" };
-// Where each team lines up. Team 1 defends -Z, Team 2 defends +Z.
-const SPAWN_OFFSETS = [0, 4, -4, 8, -8, 12, -12, 6, -6, 10, -10];
+const COLORS = [
+  "#ff5252", "#40c4ff", "#69f0ae", "#ffd740",
+  "#e040fb", "#ff6e40", "#18ffff", "#b2ff59",
+];
+// Fixed spawn points spread around the arena.
+const SPAWNS = [
+  { x: 30, z: 30 }, { x: -30, z: 30 }, { x: 30, z: -30 }, { x: -30, z: -30 },
+  { x: 0, z: 33 }, { x: 0, z: -33 }, { x: 33, z: 0 }, { x: -33, z: 0 },
+];
 
 let nextId = 1;
-/** id -> { id, team, name, color, x, z, ry, spawnX, spawnZ, ws } */
+/** id -> { id, name, color, x, z, ry, rx, health, alive, frags, ws } */
 const players = new Map();
-const teamCounts = { 1: 0, 2: 0 };
-
-const ball = { x: 0, z: 0, vx: 0, vz: 0 };
-const scores = { 1: 0, 2: 0 };
-let mode = "playing"; // "playing" | "celebrating" | "gameover"
+let mode = "playing"; // "playing" | "gameover"
 let phaseTimer = null;
 
-function spawnFor(team, indexInTeam) {
-  const baseZ = team === 1 ? -ARENA_Z * 0.55 : ARENA_Z * 0.55;
-  const x = SPAWN_OFFSETS[indexInTeam % SPAWN_OFFSETS.length] ?? 0;
-  return { x, z: baseZ };
+function pickColor() {
+  const used = new Set([...players.values()].map((p) => p.color));
+  return COLORS.find((c) => !used.has(c)) || COLORS[(nextId - 1) % COLORS.length];
 }
 
-function broadcast(obj) {
+function randomSpawn() {
+  return SPAWNS[Math.floor(Math.random() * SPAWNS.length)];
+}
+
+function broadcast(obj, exceptId = null) {
   const payload = JSON.stringify(obj);
   for (const p of players.values()) {
+    if (p.id === exceptId) continue;
     if (p.ws.readyState === 1) p.ws.send(payload);
   }
 }
 
-function spawnPayload() {
-  const spawns = {};
-  for (const p of players.values()) spawns[p.id] = { x: p.spawnX, z: p.spawnZ };
-  return { spawns, ball: { x: 0, z: 0 } };
+function sendTo(player, obj) {
+  if (player.ws.readyState === 1) player.ws.send(JSON.stringify(obj));
 }
 
-function resetField() {
-  ball.x = 0; ball.z = 0; ball.vx = 0; ball.vz = 0;
-  for (const p of players.values()) {
-    p.x = p.spawnX; p.z = p.spawnZ;
-    p.ry = p.team === 1 ? 0 : Math.PI; // face the opponent's end
-  }
+function respawn(player) {
+  const s = randomSpawn();
+  player.x = s.x; player.z = s.z;
+  player.health = MAX_HEALTH;
+  player.alive = true;
+  broadcast({ type: "respawn", id: player.id, x: s.x, z: s.z });
 }
 
-function newGame() {
-  scores[1] = 0; scores[2] = 0;
-  resetField();
-  mode = "playing";
-  broadcast({ type: "newgame", scores: { ...scores }, ...spawnPayload() });
-}
-
-function onGoal(scoringTeam) {
-  scores[scoringTeam]++;
-  resetField(); // freezes ball at center + sends players home
-  broadcast({ type: "goal", team: scoringTeam, scores: { ...scores }, ...spawnPayload() });
-
+function startGameOver(winner) {
+  mode = "gameover";
+  broadcast({
+    type: "gameover",
+    winner: winner.id,
+    winnerName: winner.name,
+    standings: standings(),
+  });
   clearTimeout(phaseTimer);
-  if (scores[scoringTeam] >= WIN_SCORE) {
-    mode = "gameover";
-    broadcast({ type: "gameover", winner: scoringTeam, scores: { ...scores } });
-    phaseTimer = setTimeout(newGame, GAMEOVER_MS);
-  } else {
-    mode = "celebrating";
-    phaseTimer = setTimeout(() => { mode = "playing"; }, CELEBRATE_MS);
+  phaseTimer = setTimeout(newMatch, GAMEOVER_MS);
+}
+
+function newMatch() {
+  mode = "playing";
+  const spawns = {};
+  for (const p of players.values()) {
+    const s = randomSpawn();
+    p.x = s.x; p.z = s.z; p.health = MAX_HEALTH; p.alive = true; p.frags = 0;
+    spawns[p.id] = { x: s.x, z: s.z };
+  }
+  broadcast({ type: "newmatch", spawns });
+}
+
+function standings() {
+  return [...players.values()]
+    .map((p) => ({ id: p.id, name: p.name, frags: p.frags, color: p.color }))
+    .sort((a, b) => b.frags - a.frags);
+}
+
+function applyDamage(target, dmg, killerId) {
+  if (mode !== "playing" || !target.alive) return;
+  target.health -= dmg;
+  sendTo(target, { type: "damaged", from: killerId });
+
+  if (target.health <= 0) {
+    target.health = 0;
+    target.alive = false;
+    const killer = players.get(killerId);
+    if (killer && killer.id !== target.id) killer.frags++;
+    broadcast({
+      type: "death",
+      victim: target.id, victimName: target.name,
+      killer: killer ? killer.id : null,
+      killerName: killer ? killer.name : "the void",
+    });
+    if (killer && killer.id !== target.id && killer.frags >= FRAG_LIMIT) {
+      startGameOver(killer);
+    } else {
+      setTimeout(() => { if (players.has(target.id) && mode === "playing") respawn(target); }, RESPAWN_MS);
+    }
   }
 }
 
@@ -135,93 +165,70 @@ const wss = new WebSocketServer({ server: httpServer });
 
 wss.on("connection", (ws) => {
   const id = nextId++;
-  const team = id % 2 === 1 ? 1 : 2;     // odd -> Team 1, even -> Team 2
-  const idx = teamCounts[team]++;
-  const spawn = spawnFor(team, idx);
+  const s = randomSpawn();
   const player = {
-    id, team, name: `Player ${id}`, color: TEAM_COLORS[team],
-    x: spawn.x, z: spawn.z, ry: team === 1 ? 0 : Math.PI,
-    spawnX: spawn.x, spawnZ: spawn.z, ws,
+    id, name: `Player ${id}`, color: pickColor(),
+    x: s.x, z: s.z, ry: 0, rx: 0,
+    health: MAX_HEALTH, alive: true, frags: 0, ws,
   };
   players.set(id, player);
 
-  ws.send(JSON.stringify({
+  sendTo(player, {
     type: "init",
-    id, team, color: player.color,
-    arenaX: ARENA_X, arenaZ: ARENA_Z, goalHalf: GOAL_HALF,
-    winScore: WIN_SCORE,
-    scores: { ...scores }, mode,
-    spawn: { x: spawn.x, z: spawn.z },
-  }));
+    id, color: player.color, arena: ARENA, fragLimit: FRAG_LIMIT,
+    maxHealth: MAX_HEALTH, spawn: { x: s.x, z: s.z }, mode,
+  });
 
   ws.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    if (msg.type === "join" && typeof msg.name === "string") {
-      player.name = msg.name.slice(0, 16) || player.name;
-    } else if (msg.type === "input" && mode === "playing") {
-      // Trust + clamp the client's position into the pitch bounds.
-      if (Number.isFinite(msg.x)) player.x = Math.max(-ARENA_X, Math.min(ARENA_X, msg.x));
-      if (Number.isFinite(msg.z)) player.z = Math.max(-ARENA_Z, Math.min(ARENA_Z, msg.z));
-      if (Number.isFinite(msg.ry)) player.ry = msg.ry;
+    switch (msg.type) {
+      case "join":
+        if (typeof msg.name === "string") player.name = msg.name.slice(0, 16) || player.name;
+        break;
+
+      case "input":
+        // Client-authoritative position/look; clamp into arena bounds.
+        if (Number.isFinite(msg.x)) player.x = Math.max(-BOUND, Math.min(BOUND, msg.x));
+        if (Number.isFinite(msg.z)) player.z = Math.max(-BOUND, Math.min(BOUND, msg.z));
+        if (Number.isFinite(msg.ry)) player.ry = msg.ry;
+        if (Number.isFinite(msg.rx)) player.rx = msg.rx;
+        break;
+
+      case "hit": {
+        // "I shot player <target> for <damage>." Validate + apply.
+        const target = players.get(msg.target);
+        const dmg = Math.max(0, Math.min(100, Number(msg.damage) || 0));
+        if (target && player.alive && dmg > 0) applyDamage(target, dmg, id);
+        break;
+      }
+
+      case "heal":
+        if (player.alive && mode === "playing") {
+          const amt = Math.max(0, Math.min(MAX_HEALTH, Number(msg.amount) || 0));
+          player.health = Math.min(MAX_HEALTH, player.health + amt);
+        }
+        break;
+
+      case "shoot":
+        // Relay a shot so other clients can render a tracer + muzzle flash.
+        broadcast({
+          type: "shoot", id,
+          ox: msg.ox, oy: msg.oy, oz: msg.oz,
+          dx: msg.dx, dy: msg.dy, dz: msg.dz,
+          w: msg.w,
+        }, id);
+        break;
     }
   });
 
   const drop = () => {
-    if (players.delete(id)) teamCounts[team] = Math.max(0, teamCounts[team] - 1);
+    if (players.delete(id)) broadcast({ type: "left", id });
   };
   ws.on("close", drop);
   ws.on("error", drop);
 });
-
-// ---------------------------------------------------------------------------
-// Server-authoritative physics tick (ball + goals) — 30 Hz
-// ---------------------------------------------------------------------------
-const TICK_HZ = 30;
-const dt = 1 / TICK_HZ;
-const FRICTION = 0.98;     // ball rolls a while before stopping
-const PUSH_SPEED = 16;     // how hard a player "kicks" the ball
-
-setInterval(() => {
-  if (mode !== "playing") return; // ball is frozen during celebration / game over
-
-  // Integrate ball motion + friction.
-  ball.vx *= FRICTION;
-  ball.vz *= FRICTION;
-  ball.x += ball.vx * dt;
-  ball.z += ball.vz * dt;
-
-  // Sidelines (±X) always bounce.
-  const limitX = ARENA_X - BALL_RADIUS;
-  if (ball.x < -limitX) { ball.x = -limitX; ball.vx = Math.abs(ball.vx); }
-  if (ball.x > limitX) { ball.x = limitX; ball.vx = -Math.abs(ball.vx); }
-
-  const limitZ = ARENA_Z - BALL_RADIUS;
-  // +Z end is Team 2's goal -> Team 1 scores there.
-  if (ball.z > ARENA_Z && Math.abs(ball.x) < GOAL_HALF) return onGoal(1);
-  if (ball.z > limitZ && Math.abs(ball.x) >= GOAL_HALF) { ball.z = limitZ; ball.vz = -Math.abs(ball.vz); }
-  // -Z end is Team 1's goal -> Team 2 scores there.
-  if (ball.z < -ARENA_Z && Math.abs(ball.x) < GOAL_HALF) return onGoal(2);
-  if (ball.z < -limitZ && Math.abs(ball.x) >= GOAL_HALF) { ball.z = -limitZ; ball.vz = Math.abs(ball.vz); }
-
-  // Resolve player kicks: if a player overlaps the ball, shove it away.
-  const minDist = PLAYER_RADIUS + BALL_RADIUS;
-  for (const p of players.values()) {
-    const dx = ball.x - p.x;
-    const dz = ball.z - p.z;
-    const dist = Math.hypot(dx, dz) || 0.0001;
-    if (dist < minDist) {
-      const nx = dx / dist;
-      const nz = dz / dist;
-      const overlap = minDist - dist;
-      ball.x += nx * overlap;
-      ball.z += nz * overlap;
-      ball.vx = nx * PUSH_SPEED;
-      ball.vz = nz * PUSH_SPEED;
-    }
-  }
-}, 1000 / TICK_HZ);
 
 // ---------------------------------------------------------------------------
 // State broadcast — 20 Hz
@@ -230,15 +237,15 @@ setInterval(() => {
   broadcast({
     type: "state",
     mode,
-    scores: { ...scores },
     players: [...players.values()].map((p) => ({
-      id: p.id, name: p.name, team: p.team, color: p.color,
-      x: +p.x.toFixed(2), z: +p.z.toFixed(2), ry: +p.ry.toFixed(2),
+      id: p.id, name: p.name, color: p.color,
+      x: +p.x.toFixed(2), z: +p.z.toFixed(2),
+      ry: +p.ry.toFixed(2), rx: +p.rx.toFixed(2),
+      health: p.health, alive: p.alive, frags: p.frags,
     })),
-    ball: { x: +ball.x.toFixed(2), z: +ball.z.toFixed(2) },
   });
 }, 1000 / 20);
 
 httpServer.listen(PORT, () => {
-  console.log(`\n  ⚽  Multiplayer soccer POC running:  http://localhost:${PORT}\n`);
+  console.log(`\n  🔫  Multiplayer shooter POC running:  http://localhost:${PORT}\n`);
 });
