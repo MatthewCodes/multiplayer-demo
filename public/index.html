@@ -169,8 +169,7 @@ let currentWeapon = 'pistol';
 let pistolAmmo = 30, pistolMaxAmmo = 30;
 let mgAmmo = 0, mgMaxAmmo = 120;
 
-const bullets = [];     // purely-visual tracers (local + remote)
-const particles = [];
+const particles = [];   // impacts, muzzle flashes, tracer beams
 const walls = [];
 const pickups = [];
 
@@ -405,35 +404,37 @@ function shoot() {
   }
   dir.normalize();
 
-  // Hit detection against other players' meshes.
-  const meshes = [];
-  for (const o of others.values()) if (o.alive !== false) meshes.push(o.group);
-  const raycaster = new THREE.Raycaster(camera.position.clone(), dir, 0, 200);
-  const hits = raycaster.intersectObjects(meshes, true);
+  // One raycast finds where the shot stops: the nearest of a player, a wall, or
+  // max range. Whatever is closest both ends the tracer beam and (if a player)
+  // registers the hit — so cover correctly blocks shots.
+  const RANGE = 160;
+  const rc = new THREE.Raycaster(camera.position.clone(), dir, 0, RANGE);
+  const playerMeshes = [];
+  for (const o of others.values()) if (o.alive !== false) playerMeshes.push(o.group);
+  const playerHits = rc.intersectObjects(playerMeshes, true);
+  const wallHits = rc.intersectObjects(walls.map(w => w.mesh), false);
 
-  // Visual tracer fired from the gun muzzle (offset from the eye) so you see it
-  // travel; relay the same origin/dir so other clients render the streak too.
+  const nearestPlayer = playerHits.length ? playerHits[0].distance : Infinity;
+  const nearestWall = wallHits.length ? wallHits[0].distance : Infinity;
+  let endDist = Math.min(RANGE, nearestPlayer, nearestWall);
+  let targetId = null;
+  if (nearestPlayer <= nearestWall && playerHits.length) targetId = findOwner(playerHits[0].object);
+
+  const endPoint = camera.position.clone().add(dir.clone().multiplyScalar(endDist));
+
+  // Visible tracer beam from the muzzle (offset from the eye) to the endpoint,
+  // plus relay so other clients draw the same beam.
   const muzzle = new THREE.Vector3(0.28, -0.2, -0.9).applyQuaternion(camera.quaternion).add(camera.position);
-  spawnTracer(muzzle, dir, 0xffff00);
+  makeBeam(muzzle, endPoint, 0xffff66);
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'shoot', ox: +muzzle.x.toFixed(1), oy: +muzzle.y.toFixed(1), oz: +muzzle.z.toFixed(1),
       dx: +dir.x.toFixed(3), dy: +dir.y.toFixed(3), dz: +dir.z.toFixed(3), w: currentWeapon }));
   }
 
-  if (hits.length > 0) {
-    // Make sure we didn't hit a wall first (walls aren't in `meshes`, so any
-    // hit here is a player) — but still respect line-of-sight on cover.
-    const playerDist = hits[0].distance;
-    const wallRc = new THREE.Raycaster(camera.position.clone(), dir, 0, playerDist - 0.1);
-    const wallHit = wallRc.intersectObjects(walls.map(w => w.mesh), false);
-    if (wallHit.length === 0) {
-      const targetId = findOwner(hits[0].object);
-      if (targetId != null) {
-        showHitMarker();
-        spawnParticles(hits[0].point, 0xff4400, 8);
-        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'hit', target: targetId, damage }));
-      }
-    }
+  if (targetId != null) {
+    showHitMarker();
+    spawnParticles(endPoint, 0xff4400, 8);
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'hit', target: targetId, damage }));
   }
 
   // Recoil
@@ -453,9 +454,19 @@ function findOwner(obj) {
 
 function remoteShot(msg) {
   const origin = new THREE.Vector3(msg.ox, msg.oy, msg.oz);
-  const dir = new THREE.Vector3(msg.dx, msg.dy, msg.dz);
-  spawnTracer(origin, dir, 0xff8800);
-  // little muzzle flash at the shooter
+  const dir = new THREE.Vector3(msg.dx, msg.dy, msg.dz).normalize();
+  // Find where this shot stops, ignoring the shooter's own avatar (the ray
+  // starts inside it). Draw the beam to that endpoint.
+  const RANGE = 160;
+  const rc = new THREE.Raycaster(origin, dir, 0, RANGE);
+  const meshes = [];
+  for (const [id, o] of others) if (id !== msg.id) meshes.push(o.group);
+  const ph = rc.intersectObjects(meshes, true);
+  const wh = rc.intersectObjects(walls.map(w => w.mesh), false);
+  const d = Math.min(RANGE, ph.length ? ph[0].distance : Infinity, wh.length ? wh[0].distance : Infinity);
+  const end = origin.clone().add(dir.clone().multiplyScalar(d));
+  makeBeam(origin, end, 0xff8844);
+  // muzzle flash at the shooter
   const flash = new THREE.Mesh(new THREE.SphereGeometry(0.2, 8, 8),
     new THREE.MeshBasicMaterial({ color: 0xffdd44, transparent: true, opacity: 0.9 }));
   flash.position.copy(origin).add(dir.clone().multiplyScalar(0.6));
@@ -463,21 +474,21 @@ function remoteShot(msg) {
   particles.push({ mesh: flash, life: 0.05, maxLife: 0.05, isMuzzle: true });
 }
 
-function spawnTracer(origin, dir, color) {
-  // An elongated glowing rod, oriented along the travel direction, so the shot
-  // visibly streaks forward instead of shrinking into the crosshair.
-  const len = 3.5;
+function makeBeam(start, end, color) {
+  // A bright cylinder spanning muzzle -> endpoint, shown briefly. Because the
+  // muzzle is offset from the eye, the beam reads as a visible streak even when
+  // firing straight ahead (no end-on foreshortening).
+  const seg = new THREE.Vector3().subVectors(end, start);
+  const length = seg.length();
+  if (length < 0.05) return;
   const mesh = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.09, 0.09, len, 6),
-    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 })
+    new THREE.CylinderGeometry(0.07, 0.07, length, 6),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 })
   );
-  const d = dir.clone().normalize();
-  mesh.position.copy(origin);
-  // CylinderGeometry's long axis is +Y; rotate it to point along `d`.
-  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d);
-  mesh.add(new THREE.PointLight(0xffaa00, 2, 6));
+  mesh.position.copy(start).addScaledVector(seg, 0.5);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), seg.clone().normalize());
   scene.add(mesh);
-  bullets.push({ mesh, direction: d, speed: 90, life: 1.2 });
+  particles.push({ mesh, life: 0.12, maxLife: 0.12, isBeam: true });
 }
 
 function createMuzzleFlash() {
@@ -589,8 +600,8 @@ function update() {
   camera.rotation.y = yaw;
   camera.rotation.x = pitch;
 
-  // Movement (only when alive + match live)
-  if (joined && alive && mode === 'playing') {
+  // Movement (only once the server has placed us, and while alive + match live)
+  if (joined && myId != null && alive && mode === 'playing') {
     const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)));
     const right = new THREE.Vector3(1, 0, 0).applyQuaternion(new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)));
     forward.y = 0; right.y = 0; forward.normalize(); right.normalize();
@@ -635,7 +646,7 @@ function update() {
   camera.position.copy(player.position);
 
   // Send our position/look to the server (~20 Hz)
-  if (joined && ws && ws.readyState === 1 && now - update._lastSent > 50) {
+  if (joined && myId != null && ws && ws.readyState === 1 && now - update._lastSent > 50) {
     ws.send(JSON.stringify({ type: 'input', x: +player.position.x.toFixed(2), z: +player.position.z.toFixed(2), ry: +yaw.toFixed(3), rx: +pitch.toFixed(3) }));
     update._lastSent = now;
   }
@@ -656,21 +667,12 @@ function update() {
     o.group.rotation.y += diff * 0.2;
   }
 
-  // Bullet tracers
-  for (let i = bullets.length - 1; i >= 0; i--) {
-    const b = bullets[i];
-    b.mesh.position.add(b.direction.clone().multiplyScalar(b.speed * dt));
-    b.life -= dt;
-    let hitWall = false;
-    for (const wall of walls) { if (wall.box.containsPoint(b.mesh.position)) { hitWall = true; spawnParticles(b.mesh.position.clone(), 0x888888, 4); break; } }
-    if (b.life <= 0 || hitWall) { scene.remove(b.mesh); bullets.splice(i, 1); }
-  }
-
-  // Particles
+  // Particles (impacts, muzzle flashes, tracer beams)
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i]; p.life -= dt;
     if (p.velocity) { if (p.gravity) p.velocity.y -= 15 * dt; p.mesh.position.add(p.velocity.clone().multiplyScalar(dt)); p.mesh.material.opacity = p.life; }
     else if (p.isMuzzle) p.mesh.material.opacity = p.life / p.maxLife;
+    else if (p.isBeam) p.mesh.material.opacity = (p.life / p.maxLife) * 0.9;
     if (p.life <= 0) { scene.remove(p.mesh); particles.splice(i, 1); }
   }
 
