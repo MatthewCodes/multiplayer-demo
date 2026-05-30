@@ -288,6 +288,10 @@ function makeNameTag(text, color) {
   ctx.fillStyle = color; ctx.fillText(text, 128, 34);
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }));
   sprite.scale.set(4, 1, 1); sprite.position.y = 5.2;
+  // Never hit-test the floating name tag: Sprite.raycast() needs a camera-built
+  // Raycaster and would otherwise throw inside our manual shot raycasts (and we
+  // don't want shots "hitting" the name anyway).
+  sprite.raycast = () => {};
   return sprite;
 }
 
@@ -409,6 +413,7 @@ function shoot() {
   // registers the hit — so cover correctly blocks shots.
   const RANGE = 160;
   const rc = new THREE.Raycaster(camera.position.clone(), dir, 0, RANGE);
+  rc.camera = camera; // required if any Sprite ends up in the raycast set
   const playerMeshes = [];
   for (const o of others.values()) if (o.alive !== false) playerMeshes.push(o.group);
   const playerHits = rc.intersectObjects(playerMeshes, true);
@@ -459,6 +464,7 @@ function remoteShot(msg) {
   // starts inside it). Draw the beam to that endpoint.
   const RANGE = 160;
   const rc = new THREE.Raycaster(origin, dir, 0, RANGE);
+  rc.camera = camera; // required if any Sprite ends up in the raycast set
   const meshes = [];
   for (const [id, o] of others) if (id !== msg.id) meshes.push(o.group);
   const ph = rc.intersectObjects(meshes, true);
